@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Forward Linux desktop (and KDE Connect) D-Bus notifications to Apple Watch Companion.
 
-Monitors org.freedesktop.Notifications.Notify via org.freedesktop.DBus.Monitoring.BecomeMonitor
+Monitors org.freedesktop.Notifications via org.freedesktop.DBus.Monitoring.BecomeMonitor
 so it never replaces or interferes with the desktop notification daemon (DMS/Quickshell).
-Encodes BulletinDistributorCodec.BulletinRequest in pure Python and submits it over the
-same-user UNIX domain control socket exposed by apple_watch_companion.
+Supports:
+- Apple watchOS HIG Short Look / Long Look field shaping (including KDE Connect formatting)
+- UNNotificationInterruptionLevel-style urgency mapping (low -> passive/no wake, normal/critical -> active)
+- Notification lifecycle sync (replaces_id -> UPDATE_TYPE_MODIFY, NotificationClosed -> REMOVE_BULLETIN)
 """
 
 from __future__ import annotations
@@ -30,11 +32,18 @@ WIRE_FIXED64 = 1
 WIRE_LENGTH_DELIMITED = 2
 
 UPDATE_TYPE_ADD = 0
+UPDATE_TYPE_MODIFY = 1
 DEFAULT_FEED = 59
 DEFAULT_SECTION_SUBTYPE = 2
 DEFAULT_SOUND_ALERT_TYPE = 2
 
+# Freedesktop NotificationClosed reasons:
+# 1 = expired, 2 = dismissed by user, 3 = closed by CloseNotification, 4 = undefined
+SYNC_CLOSE_REASONS = (2, 3)
+
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_KDE_PARENS_RE = re.compile(r"^(?P<main>.+?)\s*\((?P<app>[^()]{1,32})\)$")
+_KDE_COLON_RE = re.compile(r"^(?P<app>[A-Za-z0-9\u4e00-\u9fff._+\- ]{2,28}):\s+(?P<rest>.+)$")
 
 
 def _encode_varint(value: int) -> bytes:
@@ -110,10 +119,27 @@ def encode_bulletin_request(
 
     req = bytearray()
     req += _encode_bytes_field(1, bytes(b))
-    req += _encode_varint_field(2, 1 if sound else 0)
+    req += _encode_varint_field(2, 1 if (sound or wake) else 0)
     req += _encode_double_field(3, ts_sec)
     req += _encode_varint_field(4, update_type)
     return bid, bytes(req)
+
+
+def encode_remove_bulletin_request(
+    *,
+    bulletin_id: str,
+    section_id: str = "com.apple.MobileSMS",
+) -> bytes:
+    """Encode a BulletinDistributorCodec.RemoveBulletinRequest matching decodeExact()."""
+    if not bulletin_id or not bulletin_id.strip() or len(bulletin_id) > 128:
+        raise ValueError("Invalid bulletin_id for RemoveBulletinRequest")
+    if not section_id or not section_id.strip() or len(section_id) > 512:
+        raise ValueError("Invalid section_id for RemoveBulletinRequest")
+    out = bytearray()
+    out += _encode_string_field(1, bulletin_id)
+    out += _encode_string_field(2, bulletin_id)
+    out += _encode_string_field(3, section_id)
+    return bytes(out)
 
 
 def clean_text(text: str, max_len: int) -> str:
@@ -126,6 +152,71 @@ def clean_text(text: str, max_len: int) -> str:
     if len(joined) > max_len:
         return joined[: max_len - 1] + "…"
     return joined
+
+
+def format_notification_fields(
+    *,
+    app_name: str,
+    desktop_entry: str,
+    summary: str,
+    body: str,
+    max_title_len: int,
+    max_body_len: int,
+    kdeconnect_apps: set[str],
+) -> tuple[str, str, str | None, str]:
+    """Shape (section_display_name, title, subtitle, body) for watchOS Short/Long Look."""
+    app = clean_text(app_name, 80) or "Linux"
+    raw_title = clean_text(summary, max_title_len)
+    raw_body = clean_text(body, max_body_len)
+
+    is_kdeconnect = (
+        app.lower() in kdeconnect_apps
+        or desktop_entry.lower().startswith("org.kde.kdeconnect")
+    )
+
+    if is_kdeconnect:
+        # Typical KDE Connect patterns:
+        # 1) summary="WhatsApp: Alice", body="Hello" -> title="Alice", subtitle="WhatsApp"
+        # 2) summary="Alice (WhatsApp)", body="Hello" -> title="Alice", subtitle="WhatsApp"
+        # 3) summary="WhatsApp", body="Alice: Hello" -> title="Alice", subtitle="WhatsApp", body="Hello"
+        title = raw_title
+        subtitle: str | None = None
+        msg = raw_body
+        section_name = "手機"
+
+        m_colon = _KDE_COLON_RE.match(raw_title) if raw_title else None
+        m_parens = _KDE_PARENS_RE.match(raw_title) if raw_title else None
+        if m_colon and not m_colon.group("app").isdigit():
+            subtitle = clean_text(m_colon.group("app"), 48)
+            title = clean_text(m_colon.group("rest"), max_title_len)
+            section_name = subtitle
+        elif m_parens:
+            subtitle = clean_text(m_parens.group("app"), 48)
+            title = clean_text(m_parens.group("main"), max_title_len)
+            section_name = subtitle
+        elif raw_title and raw_body:
+            m_body = _KDE_COLON_RE.match(raw_body)
+            if m_body and len(raw_title) <= 28 and not m_body.group("app").isdigit():
+                subtitle = raw_title
+                section_name = raw_title
+                title = clean_text(m_body.group("app"), max_title_len)
+                msg = clean_text(m_body.group("rest"), max_body_len)
+            else:
+                subtitle = "手機"
+
+        if not title:
+            title = subtitle or "手機通知"
+        if not msg:
+            msg = title
+        return section_name, title, subtitle, msg
+
+    # Regular desktop notification: front-load summary as Short Look title.
+    if not raw_title:
+        return app, app, None, raw_body
+    if not raw_body:
+        return app, raw_title, None, app
+    subtitle = app if app.lower() != raw_title.lower() else None
+    return app, raw_title, subtitle, raw_body
 
 
 def default_socket_path() -> Path:
@@ -151,10 +242,18 @@ class RelayConfig:
     silent: bool = False
     ignore_transient: bool = True
     ignore_low_urgency: bool = False
+    sync_close: bool = True
     dedupe_window_sec: float = 5.0
     min_interval_sec: float = 0.5
-    max_title_len: int = 160
+    max_title_len: int = 80
     max_body_len: int = 800
+    kdeconnect_apps: list[str] = field(
+        default_factory=lambda: [
+            "KDE Connect",
+            "kdeconnect",
+            "kdeconnectd",
+        ]
+    )
     ignore_apps: list[str] = field(
         default_factory=lambda: [
             "apple_watch_companion",
@@ -190,16 +289,83 @@ class RelayConfig:
             "silent",
             "ignore_transient",
             "ignore_low_urgency",
+            "sync_close",
             "dedupe_window_sec",
             "min_interval_sec",
             "max_title_len",
             "max_body_len",
+            "kdeconnect_apps",
             "ignore_apps",
             "ignore_categories",
         ):
             if key in raw:
                 setattr(cfg, key, raw[key])
         return cfg
+
+
+@dataclass
+class TrackedBulletin:
+    bulletin_id: str
+    section_id: str
+    updated_at: float
+
+
+class NotificationTracker:
+    """Tracks D-Bus notification IDs <-> Apple Watch bulletinIds for updates and close sync."""
+
+    def __init__(self, max_entries: int = 512, pending_ttl_sec: float = 15.0) -> None:
+        self.max_entries = max_entries
+        self.pending_ttl_sec = pending_ttl_sec
+        self._active: dict[int, TrackedBulletin] = {}
+        self._pending: dict[tuple[str, int], TrackedBulletin] = {}
+
+    def prepare_send(
+        self,
+        *,
+        sender: str,
+        serial: int,
+        replaces_id: int,
+        section_id: str,
+        now: float | None = None,
+    ) -> tuple[str, int]:
+        ts = time.monotonic() if now is None else now
+        self._prune(ts)
+        if replaces_id > 0 and replaces_id in self._active:
+            entry = self._active[replaces_id]
+            entry.updated_at = ts
+            if sender and serial:
+                self._pending[(sender, serial)] = entry
+            return entry.bulletin_id, UPDATE_TYPE_MODIFY
+
+        entry = TrackedBulletin(bulletin_id=str(uuid.uuid4()), section_id=section_id, updated_at=ts)
+        if replaces_id > 0:
+            self._active[replaces_id] = entry
+        if sender and serial:
+            self._pending[(sender, serial)] = entry
+        return entry.bulletin_id, UPDATE_TYPE_ADD
+
+    def bind_reply(self, *, destination: str, reply_serial: int, nid: int, now: float | None = None) -> bool:
+        ts = time.monotonic() if now is None else now
+        entry = self._pending.pop((destination, reply_serial), None)
+        if entry is None or nid <= 0:
+            return False
+        entry.updated_at = ts
+        self._active[nid] = entry
+        self._prune(ts)
+        return True
+
+    def on_closed(self, *, nid: int, reason: int) -> TrackedBulletin | None:
+        if reason not in SYNC_CLOSE_REASONS:
+            return None
+        return self._active.pop(nid, None)
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.pending_ttl_sec
+        self._pending = {k: v for k, v in self._pending.items() if v.updated_at >= cutoff}
+        if len(self._active) > self.max_entries:
+            oldest = sorted(self._active.items(), key=lambda kv: kv[1].updated_at)
+            for nid, _ in oldest[: len(self._active) - self.max_entries]:
+                self._active.pop(nid, None)
 
 
 class NotificationFilter:
@@ -209,6 +375,7 @@ class NotificationFilter:
         self._last_sent_at: float = 0.0
         self._ignore_apps_lower = {a.lower() for a in config.ignore_apps}
         self._ignore_categories_lower = {c.lower() for c in config.ignore_categories}
+        self._kdeconnect_apps_lower = {a.lower() for a in config.kdeconnect_apps}
 
     def evaluate(
         self,
@@ -216,6 +383,8 @@ class NotificationFilter:
         summary: str,
         body: str,
         hints: dict[str, Any],
+        *,
+        is_update: bool = False,
         now: float | None = None,
     ) -> tuple[bool, str, dict[str, Any] | None]:
         ts = time.monotonic() if now is None else now
@@ -242,43 +411,57 @@ class NotificationFilter:
         if self.config.ignore_low_urgency and urgency_val == 0:
             return False, "low_urgency", None
 
-        title = clean_text(str(summary or ""), self.config.max_title_len)
-        msg = clean_text(str(body or ""), self.config.max_body_len)
-        if not title and not msg:
+        if not clean_text(str(summary or ""), 16) and not clean_text(str(body or ""), 16):
             return False, "empty", None
-        if not title:
-            title = app
-        if not msg:
-            msg = title
-            title = app
+
+        section_name, title, subtitle, msg = format_notification_fields(
+            app_name=app,
+            desktop_entry=desktop_entry,
+            summary=str(summary or ""),
+            body=str(body or ""),
+            max_title_len=self.config.max_title_len,
+            max_body_len=self.config.max_body_len,
+            kdeconnect_apps=self._kdeconnect_apps_lower,
+        )
 
         # Prune expired deduplication entries.
         cutoff = ts - self.config.dedupe_window_sec
         self._recent = {k: v for k, v in self._recent.items() if v >= cutoff}
-        key = (app.lower(), title, msg)
+        key = (section_name.lower(), title, msg)
         if key in self._recent:
             return False, "duplicate", None
 
-        if self._last_sent_at > 0 and (ts - self._last_sent_at) < self.config.min_interval_sec:
+        if (not is_update) and self._last_sent_at > 0 and (ts - self._last_sent_at) < self.config.min_interval_sec:
             return False, "rate_limited", None
 
         self._recent[key] = ts
         self._last_sent_at = ts
 
         suppress_sound = bool(hints.get("suppress-sound", False))
-        sound = (not self.config.silent) and (not suppress_sound)
-        subtitle = app if app.lower() != title.lower() else None
+        # Urgency mapping aligned with Apple UNNotificationInterruptionLevel:
+        # - urgency 0 (Low) -> passive (silent, no display wake)
+        # - in-place updates -> passive unless urgency 2 (Critical)
+        # - urgency 1/2 -> active (wakes display & plays sound unless muted)
+        if urgency_val == 0 or (is_update and urgency_val < 2):
+            sound = False
+            turns_on_display = False
+        else:
+            sound = (not self.config.silent) and (not suppress_sound)
+            turns_on_display = not self.config.silent
+
         return True, "ok", {
-            "section_display_name": app,
+            "section_display_name": section_name,
             "title": title,
             "subtitle": subtitle,
             "body": msg,
             "sound": sound,
+            "turns_on_display": turns_on_display,
+            "urgency": urgency_val,
         }
 
 
-def send_to_socket(socket_path: Path, payload_b64: str, timeout: float = 2.0) -> dict[str, Any]:
-    request = json.dumps({"method": "sendBulletin", "payload": payload_b64}, separators=(",", ":")) + "\n"
+def send_control_command(socket_path: Path, method: str, payload_b64: str, timeout: float = 2.0) -> dict[str, Any]:
+    request = json.dumps({"method": method, "payload": payload_b64}, separators=(",", ":")) + "\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
         sock.connect(str(socket_path))
@@ -319,48 +502,129 @@ def run_monitor(config: RelayConfig, socket_path: Path, dry_run: bool, verbose: 
     DBusGMainLoop(set_as_default=True)
     bus = dbus.SessionBus()
     filt = NotificationFilter(config)
+    tracker = NotificationTracker()
 
     def on_message(_connection: Any, message: Any) -> Any:
-        if message.get_type() != dbus.lowlevel.MESSAGE_TYPE_METHOD_CALL:
+        mtype = message.get_type()
+
+        # 1) Capture Notify return value (uint32 notification ID) to bind for future updates/closes.
+        if mtype == dbus.lowlevel.MESSAGE_TYPE_METHOD_RETURN:
+            args = message.get_args_list()
+            if len(args) == 1:
+                try:
+                    nid = int(args[0])
+                except (TypeError, ValueError):
+                    nid = 0
+                if nid > 0:
+                    dest = str(message.get_destination() or "")
+                    reply_serial = int(message.get_reply_serial() or 0)
+                    if tracker.bind_reply(destination=dest, reply_serial=reply_serial, nid=nid) and verbose:
+                        print(f"[watch-notify-relay] bound nid={nid}", flush=True)
             return dbus.lowlevel.HANDLER_RESULT_HANDLED
-        if message.get_interface() != "org.freedesktop.Notifications" or message.get_member() != "Notify":
+
+        # 2) Sync user dismissal / CloseNotification -> REMOVE_BULLETIN.
+        if (
+            mtype == dbus.lowlevel.MESSAGE_TYPE_SIGNAL
+            and message.get_interface() == "org.freedesktop.Notifications"
+            and message.get_member() == "NotificationClosed"
+        ):
+            if not config.sync_close:
+                return dbus.lowlevel.HANDLER_RESULT_HANDLED
+            args = message.get_args_list()
+            if len(args) >= 2:
+                try:
+                    nid = int(args[0])
+                    reason = int(args[1])
+                except (TypeError, ValueError):
+                    return dbus.lowlevel.HANDLER_RESULT_HANDLED
+                entry = tracker.on_closed(nid=nid, reason=reason)
+                if entry is not None:
+                    raw_rm = encode_remove_bulletin_request(
+                        bulletin_id=entry.bulletin_id,
+                        section_id=entry.section_id,
+                    )
+                    encoded_rm = base64.b64encode(raw_rm).decode("ascii")
+                    if dry_run:
+                        print(f"[watch-notify-relay] dry-run remove nid={nid} id={entry.bulletin_id}", flush=True)
+                    else:
+                        try:
+                            resp = send_control_command(socket_path, "removeBulletin", encoded_rm)
+                            print(
+                                f"[watch-notify-relay] removed nid={nid} id={entry.bulletin_id} "
+                                f"reason={reason} status={resp.get('status')}",
+                                flush=True,
+                            )
+                        except OSError as exc:
+                            print(f"[watch-notify-relay] remove socket unavailable: {exc}", file=sys.stderr, flush=True)
             return dbus.lowlevel.HANDLER_RESULT_HANDLED
+
+        # 3) Forward Notify -> SEND_BULLETIN (ADD or MODIFY).
+        if (
+            mtype != dbus.lowlevel.MESSAGE_TYPE_METHOD_CALL
+            or message.get_interface() != "org.freedesktop.Notifications"
+            or message.get_member() != "Notify"
+        ):
+            return dbus.lowlevel.HANDLER_RESULT_HANDLED
+
         args = message.get_args_list()
         if len(args) < 7:
             return dbus.lowlevel.HANDLER_RESULT_HANDLED
         app_name = str(args[0])
+        try:
+            replaces_id = int(args[1])
+        except (TypeError, ValueError):
+            replaces_id = 0
         summary = str(args[3])
         body = str(args[4])
         hints = _unwrap_dbus_hints(args[6])
 
-        allow, reason, item = filt.evaluate(app_name, summary, body, hints)
+        is_known_update = replaces_id > 0 and replaces_id in tracker._active
+        allow, reason, item = filt.evaluate(
+            app_name,
+            summary,
+            body,
+            hints,
+            is_update=is_known_update,
+        )
         if not allow or item is None:
             if verbose:
                 print(f"[watch-notify-relay] skip ({reason}) app={app_name!r}", flush=True)
             return dbus.lowlevel.HANDLER_RESULT_HANDLED
 
-        bid, raw_proto = encode_bulletin_request(
+        sender = str(message.get_sender() or "")
+        serial = int(message.get_serial() or 0)
+        bid, update_type = tracker.prepare_send(
+            sender=sender,
+            serial=serial,
+            replaces_id=replaces_id,
+            section_id=config.section_id,
+        )
+        _, raw_proto = encode_bulletin_request(
+            bulletin_id=bid,
             title=item["title"],
             subtitle=item["subtitle"],
             body=item["body"],
             section_id=config.section_id,
             section_display_name=item["section_display_name"],
             sound=item["sound"],
+            turns_on_display=item["turns_on_display"],
+            update_type=update_type,
         )
         encoded = base64.b64encode(raw_proto).decode("ascii")
+        op = "modify" if update_type == UPDATE_TYPE_MODIFY else "add"
         if dry_run:
             print(
-                f"[watch-notify-relay] dry-run id={bid} app={item['section_display_name']!r} "
-                f"title={item['title']!r} len={len(raw_proto)}",
+                f"[watch-notify-relay] dry-run {op} id={bid} app={item['section_display_name']!r} "
+                f"title={item['title']!r} sound={item['sound']} wake={item['turns_on_display']}",
                 flush=True,
             )
             return dbus.lowlevel.HANDLER_RESULT_HANDLED
 
         try:
-            resp = send_to_socket(socket_path, encoded)
+            resp = send_control_command(socket_path, "sendBulletin", encoded)
             print(
-                f"[watch-notify-relay] sent id={bid} app={item['section_display_name']!r} "
-                f"status={resp.get('status')}",
+                f"[watch-notify-relay] sent {op} id={bid} app={item['section_display_name']!r} "
+                f"sound={item['sound']} wake={item['turns_on_display']} status={resp.get('status')}",
                 flush=True,
             )
         except OSError as exc:
@@ -372,10 +636,12 @@ def run_monitor(config: RelayConfig, socket_path: Path, dry_run: bool, verbose: 
     bus.add_message_filter(on_message)
     mon = bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
     iface = dbus.Interface(mon, "org.freedesktop.DBus.Monitoring")
-    iface.BecomeMonitor(
-        ["type='method_call',interface='org.freedesktop.Notifications',member='Notify'"],
-        dbus.UInt32(0),
-    )
+    rules = [
+        "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+        "type='method_return'",
+        "type='signal',interface='org.freedesktop.Notifications',member='NotificationClosed'",
+    ]
+    iface.BecomeMonitor(rules, dbus.UInt32(0))
 
     loop = GLib.MainLoop()
 
@@ -394,7 +660,7 @@ def main() -> int:
     parser.add_argument("--socket", type=Path, default=None, help="Control socket path")
     parser.add_argument("--config", type=Path, default=None, help="JSON config path")
     parser.add_argument("--dry-run", action="store_true", help="Do not send to control socket")
-    parser.add_argument("--verbose", action="store_true", help="Log skipped notifications")
+    parser.add_argument("--verbose", action="store_true", help="Log skipped notifications and ID bindings")
     args = parser.parse_args()
 
     cfg = RelayConfig.load(args.config or default_config_path())
