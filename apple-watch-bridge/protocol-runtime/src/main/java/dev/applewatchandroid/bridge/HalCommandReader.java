@@ -337,6 +337,10 @@ final class HalCommandReader {
                         } finally { if (settingPayload != null) Arrays.fill(settingPayload, (byte) 0); }
                         continue;
                     }
+                    if (line.equals("PULL_HEALTH")) {
+                        ProtocolHost.triggerHealthPull();
+                        continue;
+                    }
                     if (line.startsWith("SEND_BULLETIN:")) {
                         byte[] payload = null;
                         try {

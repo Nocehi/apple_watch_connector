@@ -504,6 +504,12 @@ impl LinuxBackend {
                     "watchReady":self.child.is_some() && state.ready,
                     "health":health})
             }
+            Some("pullHealth") => {
+                if self.child.is_none() || !self.state.lock().unwrap().ready {
+                    return json!({"status":"WATCH_NOT_READY"});
+                }
+                self.send("PULL_HEALTH")
+            }
             Some("stop") => {
                 self.resume_after_stop = false;
                 if self.child.is_none() {

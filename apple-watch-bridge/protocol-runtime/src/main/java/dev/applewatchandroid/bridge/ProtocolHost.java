@@ -468,4 +468,11 @@ class ProtocolHost {
         return output.append(']').toString();
     }
 
+    private static volatile Runnable healthPullHandler;
+    static void setHealthPullHandler(Runnable handler) { healthPullHandler = handler; }
+    static void triggerHealthPull() {
+        Runnable handler = healthPullHandler;
+        if (handler != null) handler.run();
+    }
+
 }
