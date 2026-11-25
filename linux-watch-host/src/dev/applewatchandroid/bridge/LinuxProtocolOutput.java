@@ -22,10 +22,18 @@ final class LinuxProtocolOutput implements AutoCloseable {
     private final PrintStream previous;
     private final PrintStream filtered;
     private final Journal journal;
+    private final LinuxHealthController health;
 
     LinuxProtocolOutput(Path path, DesktopSecretStore secrets, BlockingQueue<Boolean> bonds,
                         BlockingQueue<Boolean> records, AtomicBoolean stop) throws IOException {
+        this(path, secrets, bonds, records, stop, null);
+    }
+
+    LinuxProtocolOutput(Path path, DesktopSecretStore secrets, BlockingQueue<Boolean> bonds,
+                        BlockingQueue<Boolean> records, AtomicBoolean stop,
+                        LinuxHealthController health) throws IOException {
         previous = System.out;
+        this.health = health;
         journal = new Journal(path, 16 * 1024 * 1024);
         filtered = new PrintStream(new OutputStream() {
             private final ByteArrayOutputStream line = new ByteArrayOutputStream();
@@ -57,6 +65,10 @@ final class LinuxProtocolOutput implements AutoCloseable {
             if (text.startsWith(LOCAL_IDENTITY_PREFIX) || text.startsWith(LOCAL_IDS_PUBLIC_PREFIX)
                     || text.startsWith(RESTORED_PAIRING_SESSION_PREFIX)) {
                 throw new IOException("Unexpected private output envelope");
+            }
+            if (health != null && health.handleLine(text)) {
+                // Consume raw Health IPC frames inside JVM without exposing key/ciphertext to stdout or journal.
+                return;
             }
             int preview = text.indexOf(" bodyPreview=");
             String visible = preview < 0 ? text : text.substring(0, preview) + "; body logged=false.";

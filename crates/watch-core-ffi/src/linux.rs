@@ -31,7 +31,7 @@ mod control {
     };
 
     const MAX_REQUEST: u64 = 256 * 1024;
-    const METHODS: [&str; 3] = ["sendBulletin", "removeBulletin", "bulletinStatus"];
+    const METHODS: [&str; 4] = ["sendBulletin", "removeBulletin", "bulletinStatus", "healthStatus"];
 
     pub(super) fn socket_path() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os("WATCH_COMPANION_CONTROL_SOCKET") {

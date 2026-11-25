@@ -493,6 +493,17 @@ impl LinuxBackend {
                 json!({"status":"OK","phase":state.phase,
                     "watchReady":self.child.is_some() && state.ready})
             }
+            Some("healthStatus") => {
+                let state = self.state.lock().unwrap();
+                let path = self.state_dir.join("health/health-latest.json");
+                let health: Value = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(Value::Null);
+                json!({"status":"OK","phase":state.phase,
+                    "watchReady":self.child.is_some() && state.ready,
+                    "health":health})
+            }
             Some("stop") => {
                 self.resume_after_stop = false;
                 if self.child.is_none() {
