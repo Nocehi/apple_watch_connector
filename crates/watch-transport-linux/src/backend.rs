@@ -470,6 +470,29 @@ impl LinuxBackend {
                 drop(state);
                 self.send("RETRY_ACTIVATION")
             }
+            Some(method @ ("sendBulletin" | "removeBulletin")) => {
+                // Local bulletin MVP: the payload is an already-encoded
+                // BulletinDistributorCodec request; the JVM decodes and
+                // validates it. QUEUED is a local queue receipt only.
+                let Some(payload) = request["payload"].as_str().filter(|p| bulletin_payload(p))
+                else {
+                    return json!({"status":"INVALID_REQUEST"});
+                };
+                if self.child.is_none() || !self.state.lock().unwrap().ready {
+                    return json!({"status":"WATCH_NOT_READY"});
+                }
+                let prefix = if method == "sendBulletin" {
+                    "SEND_BULLETIN"
+                } else {
+                    "REMOVE_BULLETIN"
+                };
+                self.send(&format!("{prefix}:{payload}"))
+            }
+            Some("bulletinStatus") => {
+                let state = self.state.lock().unwrap();
+                json!({"status":"OK","phase":state.phase,
+                    "watchReady":self.child.is_some() && state.ready})
+            }
             Some("stop") => {
                 self.resume_after_stop = false;
                 if self.child.is_none() {
@@ -482,6 +505,16 @@ impl LinuxBackend {
             _ => json!({"status":"UNSUPPORTED_OPERATION"}),
         }
     }
+}
+/// Mirrors OperationalCommandPolicy: one stdin line of standard base64.
+fn bulletin_payload(payload: &str) -> bool {
+    let body = payload.trim_end_matches('=');
+    !body.is_empty()
+        && payload.len() <= 179_000
+        && payload.len() - body.len() <= 2
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 impl Drop for LinuxBackend {
     fn drop(&mut self) {
@@ -560,6 +593,33 @@ mod tests {
         let state = backend.state.lock().unwrap();
         assert_eq!(state.phase, "IDLE");
         assert!(state.pair_id.is_some());
+    }
+
+    #[test]
+    fn bulletin_is_forwarded_only_when_ready_and_well_formed() {
+        let mut idle = LinuxBackend::new();
+        assert_eq!(
+            idle.command(json!({"method":"sendBulletin","payload":"AAEC"}))["status"],
+            "WATCH_NOT_READY"
+        );
+        let mut backend = with_child(
+            Command::new("/bin/sh")
+                .args(["-c", "read -r value; test \"$value\" = SEND_BULLETIN:AAEC"]),
+        );
+        for bad in [json!(null), json!(""), json!("AA\nSTOP"), json!("A===")] {
+            assert_eq!(
+                backend.command(json!({"method":"sendBulletin","payload":bad}))["status"],
+                "INVALID_REQUEST"
+            );
+        }
+        assert_eq!(
+            backend.command(json!({"method":"sendBulletin","payload":"AAEC"}))["status"],
+            "QUEUED"
+        );
+        let status = backend.child.as_mut().unwrap().wait().expect("child exits");
+        assert!(status.success());
+        backend.child = None;
+        backend.input = None;
     }
 
     #[test]
